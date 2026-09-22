@@ -25,7 +25,7 @@ from __future__ import annotations
 import hashlib
 import struct
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Sequence, Set, Tuple
 
 from . import pointers
 from .canonical import CanonicalError, canonical_scalar_bytes
@@ -228,3 +228,193 @@ def verify_inclusion(
             "recomputed root does not match the committed root: "
             "the path, value or a sibling hash has been altered"
         )
+
+
+# ---------------------------------------------------------------------------
+# Compact multi-leaf proof
+# ---------------------------------------------------------------------------
+#
+# Instead of repeating every sibling step once per disclosed leaf (the
+# "standard" format), the compact format names every non-disclosed tree node
+# exactly once, by its *level* (0 = leaf level) and its *index* within that
+# level.  Each disclosed leaf carries only its leaf index; the verifier folds
+# the whole set bottom-up:
+#
+#     node[level, i] =
+#         disclosed-leaf digest                    (level 0)
+#       | supplied proof node {level, i, hash}      (non-disclosed node)
+#       | H(node[L,2i], node[L,2i+1])               (both children known)
+#
+# Odd levels keep the same "duplicate the last node" rule as the standard
+# tree; the duplicated sibling is the node itself, so it is never needed in
+# the proof set.  The set of nodes named by a compact proof is therefore
+# exactly the set of nodes required for the fold: a structural validator can
+# detect both missing and extraneous nodes.
+
+
+@dataclass(frozen=True)
+class CompactNode:
+    """One proof node identified by (level, index) within the tree."""
+
+    level: int
+    index: int
+    digest: bytes
+
+
+def level_sizes(leaf_count: int) -> List[int]:
+    """Return the node count of every level, level 0 first.
+
+    The single-entry level (the root) is the last entry; a one-leaf tree
+    yields ``[1]``.
+    """
+    if leaf_count <= 0:
+        raise TreeError("leaf count must be at least 1")
+    sizes = [leaf_count]
+    while sizes[-1] > 1:
+        sizes.append((sizes[-1] + 1) // 2)
+    return sizes
+
+
+def _pairs_at_level(width: int):
+    """Yield ``(parent_index, left_index, right_index, odd_tail)`` pairs.
+
+    When the level has an odd number of nodes the last node is paired with
+    itself; ``odd_tail`` is true for that synthetic pair.
+    """
+    limit = width if width % 2 == 0 else width + 1
+    for i in range(0, limit, 2):
+        yield i // 2, i, min(i + 1, width - 1), width % 2 == 1 and i + 1 >= width
+
+
+def required_proof_nodes(
+    leaf_count: int, leaf_indices: Sequence[int]
+) -> List[CompactNode]:
+    """Plan the proof nodes needed to fold *leaf_indices* up to the root.
+
+    This mirrors the verifier's fold structurally (without hashes).  A node
+    is *known* when it is a disclosed leaf, supplied as a proof node, or
+    derivable as the parent of a pair of known children.  Whenever exactly
+    one child of a pair is known, the sibling must be supplied and is added
+    to the required set.  Every pair contributes at most one required node,
+    so a node is never required twice, even when several disclosed leaves
+    would have carried it in their individual proofs.
+    """
+    if leaf_count <= 0:
+        raise TreeError("leaf count must be at least 1")
+
+    leaf_set: Set[int] = set()
+    for idx in leaf_indices:
+        if not 0 <= idx < leaf_count:
+            raise TreeError(
+                f"leaf index {idx} out of range (leaf count {leaf_count})"
+            )
+        leaf_set.add(idx)
+
+    sizes = level_sizes(leaf_count)
+    required: Dict[Tuple[int, int], CompactNode] = {}
+    known_by_level: List[Set[int]] = [set(leaf_set)]
+
+    for level, width in enumerate(sizes[:-1]):
+        known = known_by_level[level]
+        next_known: Set[int] = set()
+        for parent, left, right, odd_tail in _pairs_at_level(width):
+            left_known = left in known
+            right_known = right in known
+            if left_known and right_known:
+                next_known.add(parent)
+            elif left_known or right_known:
+                missing_pos = right if left_known else left
+                if not odd_tail:
+                    # The sibling lives on the level currently being folded.
+                    key = (level, missing_pos)
+                    if key not in required:
+                        required[key] = CompactNode(level, missing_pos, b"")
+                next_known.add(parent)
+        known_by_level.append(next_known)
+
+    if 0 not in known_by_level[-1]:
+        # Cannot happen for a non-empty leaf set: the walk reaches the root.
+        raise TreeError("disclosed leaf set does not reach the tree root")
+    return [required[key] for key in sorted(required)]
+
+
+def compact_proof_nodes(
+    levels: Sequence[Sequence[bytes]], leaf_indices: Sequence[int]
+) -> List[CompactNode]:
+    """Materialize the required proof nodes from an expanded tree.
+
+    *levels* holds the concrete digests of every level (level 0 = sorted leaf
+    digests); the returned nodes are deduplicated by ``(level, index)`` and
+    ordered level-first, then index.
+    """
+    plan = required_proof_nodes(len(levels[0]), leaf_indices)
+    nodes: List[CompactNode] = []
+    for node in plan:
+        if node.level >= len(levels) or node.index >= len(levels[node.level]):
+            # pragma: no cover - the planner never names an out-of-tree node
+            raise TreeError(
+                f"planned proof node ({node.level},{node.index}) does not "
+                "exist in the tree"
+            )
+        nodes.append(
+            CompactNode(
+                level=node.level,
+                index=node.index,
+                digest=levels[node.level][node.index],
+            )
+        )
+    return nodes
+
+
+def tree_levels(leaf_digests: Sequence[bytes]) -> List[List[bytes]]:
+    """Expand the full tree and return the digests of every level."""
+    levels: List[List[bytes]] = [list(leaf_digests)]
+    while len(levels[-1]) > 1:
+        levels.append(fold_level(levels[-1]))
+    return levels
+
+
+def compact_root(
+    leaf_count: int,
+    leaf_digests_by_index: Mapping[int, bytes],
+    proof_nodes: Sequence[CompactNode],
+) -> bytes:
+    """Rebuild the Merkle root from disclosed leaves + compact proof nodes.
+
+    Structural validation (range, uniqueness, missing/extraneous nodes) is
+    expected to have run first; :class:`TreeError` is still raised if a fold
+    reaches a node that was neither disclosed nor supplied.
+    """
+    sizes = level_sizes(leaf_count)
+    # Seed each level with the proof nodes supplied for that level; level 0
+    # also carries the disclosed leaf digests.
+    known: List[Dict[int, bytes]] = [dict(leaf_digests_by_index)]
+    for _ in sizes[1:]:
+        known.append({})
+    for node in proof_nodes:
+        known[node.level][node.index] = node.digest
+
+    for level, width in enumerate(sizes[:-1]):
+        level_nodes = known[level]
+        next_nodes: Dict[int, bytes] = known[level + 1]
+        for parent, left, right, odd_tail in _pairs_at_level(width):
+            if parent in next_nodes:
+                continue
+            if left in level_nodes and right in level_nodes:
+                next_nodes[parent] = node_hash(
+                    level_nodes[left], level_nodes[right]
+                )
+            elif odd_tail and left in level_nodes:
+                next_nodes[parent] = node_hash(
+                    level_nodes[left], level_nodes[left]
+                )
+            elif left in level_nodes or right in level_nodes:
+                raise TreeError(
+                    f"missing proof node at level {level}, index "
+                    f"{right if left in level_nodes else left}"
+                )
+
+    root = known[-1].get(0)
+    if root is None:
+        raise TreeError("the compact proof does not reach a single root node")
+    return root

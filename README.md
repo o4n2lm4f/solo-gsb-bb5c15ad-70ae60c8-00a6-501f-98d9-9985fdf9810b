@@ -37,6 +37,7 @@ HOST_PORT=9000 docker compose up --build      # => http://localhost:9000
 | `APP_HOST` | `0.0.0.0` | uvicorn 监听地址 |
 | `APP_PORT` | `8000` | uvicorn 监听端口 |
 | `MAX_BODY_BYTES` | `10485760`（10 MiB） | 请求体大小上限，超限返回 `413` |
+| `DEFAULT_PROOF_MODE` | `standard` | `/commit` 未显式传 `proofMode` 时的默认格式，可选 `standard` / `compact` |
 | `SKIP_PIP_INSTALL` | `0` | 设为 `1` 可跳过启动时的依赖安装 |
 | `REQUIREMENTS_FILE` | `/app/requirements.txt` | 启动时安装的依赖清单路径 |
 
@@ -87,7 +88,7 @@ leaf_digest = SHA256(
 4. 恰有一个叶子时，根即为该叶哈希本身（不存在配对层）；
 5. 根只取决于文档内容，与披露哪些路径无关（同一文档两次提交根相同）。
 
-### 5. 包含证明
+### 5. 包含证明（标准格式）
 
 每个被披露叶子附带从叶到根的兄弟节点序列，每步为
 `{"side": "left"|"right", "sibling": "<hex32>"}`：
@@ -105,6 +106,46 @@ leaf_digest = SHA256(
 - 篡改**根** → 与重算结果不相等。
 
 验证接口不接收也无法接触原始文档。
+
+### 6. 紧凑多叶证明（`proofMode: "compact"`）
+
+多路径披露时，标准格式会在各叶的 `proof` 里**重复携带相同的上层兄弟节点**
+（相邻叶子还会把彼此当作 level 0 的兄弟）。紧凑格式把每个非披露树节点
+按其树坐标**全局唯一化**：
+
+- `/commit` 请求加 `"proofMode": "compact"`；
+- 响应顶层给出 `leafCount`（建树时的叶子总数，验证方据此知道每层宽度）；
+- 每个被披露叶只有 `{"path", "index", "value"}`，`index` 是该叶在
+  **按路径排序后的叶集合中的下标**（即建树下标）；
+- 兄弟节点集中放在顶层 `proofNodes`，每项
+  `{"level": <int>, "index": <int>, "hash": "<hex32>"}`，
+  以 `(level, index)` 唯一标识并按 level、再按 index 排序；
+  **同一节点只出现一次**，不再为各叶重复；
+- `level` 从叶层起算为 0；根所在的最后一层不会出现在 `proofNodes` 中；
+- 奇数层末节点与自身配对（`H(L,L)`），该节点**不需要**也**不允许**
+  出现在 `proofNodes`；
+- 披露全部叶子时 `proofNodes` 为空数组；单叶文档同样为空。
+
+验证方仅凭「根 + 披露值 + 紧凑证明」**自底向上**重建根：每层已知节点
+（披露叶、proof 节点、或由两个已知子节点折出的父节点）两两配对，
+奇数层复制末节点，逐层向上直到根。结构校验失败返回 `400 BAD_PROOF` 并带
+精确 `loc`：
+
+| 结构错误 | `loc` 示例 |
+| --- | --- |
+| 叶下标越界 / 重复 | `leaves[1].index` |
+| 节点层级越界（含给出根层） | `proofNodes[2].level` |
+| 节点层内下标越界 | `proofNodes[2].index` |
+| 奇数层末节点被携带 | `proofNodes[2]` |
+| 节点与披露叶重合 | `proofNodes[2]` |
+| `(level,index)` 重复 | `proofNodes[2]` |
+| 缺少必需节点 | `proofNodes`（`detail.missing` 列出全部缺失项） |
+| 携带多余节点 | `proofNodes[2]`（`detail.extraneous` 列出全部多余项） |
+| 哈希不是 64 位十六进制 | `proofNodes[0].hash` |
+
+结构合法但折叠出的根 ≠ 提交根（篡改路径、值或节点哈希）仍返回
+`422 ROOT_MISMATCH`。`/verify` 根据请求体**自动识别**两种格式：
+含 `proofNodes`/`leafCount` 即为紧凑格式，否则按标准格式逐叶验证。
 
 ## API
 
@@ -147,6 +188,48 @@ leaf_digest = SHA256(
 }
 ```
 
+不带 `proofMode`（或显式 `"standard"`）时响应保持上述形状不变。
+
+#### 紧凑模式（`"proofMode": "compact"`）
+
+请求：
+
+```json
+{
+  "document": {
+    "subject": { "name": "Ada", "age": 36, "isAdult": true, "nickname": null },
+    "emails": ["ada@example.com", "ada@analytical.engine"],
+    "empty": {}
+  },
+  "reveal": ["/subject/age", "/emails/1", "/empty"],
+  "proofMode": "compact"
+}
+```
+
+响应（7 个叶子按路径排序；兄弟节点按 `(level,index)` 去重后只有 2 个，
+标准格式需要 3×若干步）：
+
+```json
+{
+  "root": "f066f677ef752e68f8924da8a10ba44b2beb5a4e3ff9793e20cd38c3a3120607",
+  "proofMode": "compact",
+  "leafCount": 7,
+  "leaves": [
+    { "path": "/emails/1", "index": 1, "value": "ada@analytical.engine" },
+    { "path": "/empty", "index": 2, "value": {} },
+    { "path": "/subject/age", "index": 3, "value": 36 }
+  ],
+  "proofNodes": [
+    { "level": 0, "index": 0,
+      "hash": "10854943caa6ff2053c8e3c9c9b183b632d3a8fd04cbe94a1f518bdb5d2ab6b9" },
+    { "level": 2, "index": 1,
+      "hash": "a3a2a836c671f329a313d7f9493639bc7689d2bc3a2892be6f14c3657a1223e0" }
+  ]
+}
+```
+
+紧凑证明直接原样发给 `/verify`（不需要 `proofMode` 字段，服务自动识别）。
+
 ### `POST /verify` — 无原文校验
 
 请求体只需提交方给你的根与所选披露：
@@ -168,7 +251,39 @@ leaf_digest = SHA256(
   "leaves": [ {"path": "/subject/age", "value": 36} ] }
 ```
 
-任一条证明失败（`422`，其余结构性输入错误为 `400/413`）：
+紧凑格式的 `/verify` 请求体即 `/commit` 紧凑响应去掉 `proofMode`
+（保留 `root`、`leafCount`、`leaves`、`proofNodes`），成功时响应多一个
+`"proofMode": "compact"`：
+
+```json
+{
+  "root": "f066f677ef752e68f8924da8a10ba44b2beb5a4e3ff9793e20cd38c3a3120607",
+  "leafCount": 7,
+  "leaves": [
+    { "path": "/emails/1", "index": 1, "value": "ada@analytical.engine" },
+    { "path": "/empty", "index": 2, "value": {} },
+    { "path": "/subject/age", "index": 3, "value": 36 }
+  ],
+  "proofNodes": [
+    { "level": 0, "index": 0, "hash": "108549…b9" },
+    { "level": 2, "index": 1, "hash": "a3a2a8…e0" }
+  ]
+}
+```
+
+紧凑证明的**结构错误**（缺节点、多节点、下标越界/重复、奇数层末节点等）
+是 `400 BAD_PROOF`，例如漏掉一个必需节点：
+
+```json
+{ "error": {
+    "code": "BAD_PROOF",
+    "message": "compact proof is missing the required sibling node at level 0, index 3 …",
+    "loc": "proofNodes",
+    "detail": { "missing": [ {"level": 0, "index": 3} ] }
+} }
+```
+
+任一条证明内容失败（`422`，其余结构性输入错误为 `400/413`）：
 
 ```json
 { "error": {
@@ -193,9 +308,9 @@ leaf_digest = SHA256(
 | 400 | `EMPTY_REVEAL` | 披露列表为空 |
 | 400 | `UNSUPPORTED_VALUE` | `NaN`/`Infinity`、孤立代理项等 |
 | 400 | `BAD_HASH_ENCODING` | 根或兄弟哈希不是 64 位十六进制 |
-| 400 | `BAD_PROOF` | 证明结构错误（side 非法、兄弟长度不对） |
+| 400 | `BAD_PROOF` | 证明结构错误：标准格式 side 非法、兄弟长度不对；紧凑格式叶/节点下标越界或重复、节点缺失或多余、携带奇数层末节点等（均有精确 `loc`） |
 | 413 | `PAYLOAD_TOO_LARGE` | 请求体超过 `MAX_BODY_BYTES` |
-| 422 | `ROOT_MISMATCH` | 证明有效但重算根 ≠ 提交根（路径/值/兄弟/根被篡改） |
+| 422 | `ROOT_MISMATCH` | 证明有效但重算根 ≠ 提交根（路径/值/兄弟/节点哈希/根被篡改） |
 
 ### 其他
 
@@ -217,13 +332,23 @@ curl -s localhost:8000/verify -H 'content-type: application/json' \
   -d "{\"root\": $(jq .root /tmp/commit.json), \"leaves\": $(jq .leaves /tmp/commit.json)}"
 
 # 3) 把值改成 37 再验证 → 422 ROOT_MISMATCH，loc=leaves[0]
+
+# 4) 紧凑多叶证明：加 "proofMode": "compact"，返回 leafCount、
+#    每个叶的 index，以及按 (level,index) 去重的 proofNodes
+curl -s localhost:8000/commit -H 'content-type: application/json' -d '{
+  "document": {"subject": {"name": "Ada", "age": 36}, "emails": ["a@x", "b@y"]},
+  "reveal": ["/subject/name", "/subject/age"],
+  "proofMode": "compact"
+}'
+# /verify 自动识别紧凑格式：把紧凑响应的 root/leafCount/leaves/proofNodes
+# 原样回传即可（无需携带 document 或 proofMode）。
 ```
 
 ## 本地开发与测试（不使用 Docker）
 
 ```bash
 python3 -m pip install -r requirements-dev.txt
-python3 -m pytest -q          # 35 个测试
+python3 -m pytest -q          # 69 个测试
 python3 -m uvicorn app.main:app --reload --port 8000
 ```
 
@@ -232,13 +357,14 @@ python3 -m uvicorn app.main:app --reload --port 8000
 ```
 app/
   main.py        # FastAPI 路由：/commit、/verify、错误处理
-  tree.py        # 叶展开、叶哈希/节点哈希、排序建树、证明生成与校验
+  tree.py        # 叶展开、叶哈希/节点哈希、排序建树、标准与紧凑证明
   pointers.py    # RFC 6901 指针解析与寻址
   canonical.py   # 规范 JSON 序列化
   jsonio.py      # 严格 JSON 解析（拒绝重复键、错误定位）
   validation.py  # 提交值校验（非有限数、非 JSON 类型等）
+  openapi.py     # 两种证明格式的 OpenAPI 模型与文档合并
   errors.py      # 带 code/loc 的 API 错误类型
-tests/           # 哈希/树单元测试 + API 端到端（含全部篡改场景）
+tests/           # 哈希/树单元测试 + API 端到端（含全部篡改、去重与结构错误场景）
 Dockerfile
 docker-entrypoint.sh   # 启动时安装依赖并启动 uvicorn
 docker-compose.yml

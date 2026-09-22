@@ -8,12 +8,17 @@ import pytest
 from app.canonical import canonical_json_bytes
 from app.tree import (
     ProofStep,
+    compact_proof_nodes,
+    compact_root,
     expand_leaves,
     fold_level,
     inclusion_proof,
     leaf_hash,
+    level_sizes,
     merkle_root,
     node_hash,
+    required_proof_nodes,
+    tree_levels,
     verify_inclusion,
 )
 
@@ -159,3 +164,140 @@ def test_empty_leaf_set_rejected():
         merkle_root([])
     with pytest.raises(ValueError):
         fold_level([])
+
+
+# ---------------------------------------------------------------------------
+# Compact multi-leaf proofs
+# ---------------------------------------------------------------------------
+
+
+def test_level_sizes_shape_and_odd_floors():
+    assert level_sizes(1) == [1]
+    assert level_sizes(2) == [2, 1]
+    assert level_sizes(3) == [3, 2, 1]
+    assert level_sizes(5) == [5, 3, 2, 1]
+    with pytest.raises(ValueError):
+        level_sizes(0)
+
+
+def _compact_fold(digests, indices):
+    levels = tree_levels(digests)
+    nodes = compact_proof_nodes(levels, indices)
+    return levels, nodes, compact_root(
+        len(digests), {i: digests[i] for i in indices}, nodes
+    )
+
+
+@pytest.mark.parametrize("n", range(1, 9))
+def test_compact_proofs_for_every_nonempty_subset(n):
+    import itertools
+
+    digests = [leaf_hash(f"/k{i:02d}", i) for i in range(n)]
+    root = merkle_root(digests)
+    for width in range(1, n + 1):
+        for combo in itertools.combinations(range(n), width):
+            _levels, nodes, rebuilt = _compact_fold(digests, list(combo))
+            assert rebuilt == root, (n, combo)
+
+
+def test_compact_nodes_deduplicated_and_sorted():
+    # 7 leaves; adjacent disclosed leaves 4 and 5 pair directly at level 0,
+    # and every subtree above them is shared. The compact set names each tree
+    # position at most once, stays level/index sorted, and is strictly
+    # smaller than concatenating the two legacy per-leaf proofs.
+    digests = [leaf_hash(f"/k{i}", i) for i in range(7)]
+    levels = tree_levels(digests)
+    nodes = compact_proof_nodes(levels, [4, 5])
+    keys = [(node.level, node.index) for node in nodes]
+    assert len(keys) == len(set(keys))
+    assert keys == sorted(keys)
+
+    # The legacy proofs for leaves 4 and 5 repeat the shared upper nodes and
+    # leaf 4's "right sibling" is leaf 5 itself — which compact elides.
+    legacy_keys = set()
+    legacy_step_count = 0
+    for leaf_index in (4, 5):
+        pos = leaf_index
+        for level, width in enumerate(level_sizes(7)[:-1]):
+            odd_tail = width % 2 == 1 and pos == width - 1
+            if not odd_tail:
+                legacy_keys.add((level, pos ^ 1))
+            legacy_step_count += 1
+            pos //= 2
+    assert (0, 5) in legacy_keys  # carried by leaf 4's legacy proof...
+    assert not any(node.level == 0 and node.index == 5 for node in nodes)
+    assert len(nodes) < legacy_step_count
+    # Every compact node is also a node some legacy proof needed.
+    assert set(keys) <= legacy_keys
+
+
+def test_compact_odd_tail_node_is_never_required():
+    # 3 leaves, disclose the last leaf: its first pairing is H(L2,L2) with a
+    # duplicated tail, so no level-0 sibling node may be required.
+    digests = [leaf_hash(f"/k{i}", i) for i in range(3)]
+    levels = tree_levels(digests)
+    nodes = compact_proof_nodes(levels, [2])
+    assert [(n.level, n.index) for n in nodes] == [(1, 0)]
+    _levels, _nodes, rebuilt = _compact_fold(digests, [2])
+    assert rebuilt == merkle_root(digests)
+
+
+def test_compact_all_leaves_requires_no_proof_nodes():
+    digests = [leaf_hash(f"/k{i}", i) for i in range(6)]
+    levels = tree_levels(digests)
+    nodes = compact_proof_nodes(levels, list(range(6)))
+    assert nodes == []
+    assert compact_root(6, {i: digests[i] for i in range(6)}, []) == merkle_root(
+        digests
+    )
+
+
+def test_compact_single_leaf_tree():
+    digest = leaf_hash("/x", 1)
+    levels = tree_levels([digest])
+    assert compact_proof_nodes(levels, [0]) == []
+    assert compact_root(1, {0: digest}, []) == digest
+
+
+def test_compact_required_plan_matches_emulated_fold():
+    # Independently emulate the bottom-up fold and compare the required set.
+    digests = [leaf_hash(f"/k{i}", i) for i in range(8)]
+    disclosed = [0, 2, 3, 6]
+    plan = {
+        (node.level, node.index)
+        for node in required_proof_nodes(len(digests), disclosed)
+    }
+    expected = set()
+    known = set(disclosed)
+    sizes = level_sizes(8)
+    for level, width in enumerate(sizes[:-1]):
+        nxt = set()
+        limit = width if width % 2 == 0 else width + 1
+        for j in range(0, limit, 2):
+            left, right = j, min(j + 1, width - 1)
+            odd_tail = width % 2 == 1 and j + 1 >= width
+            if left in known and right in known:
+                nxt.add(j // 2)
+            elif (left in known or right in known) and not odd_tail:
+                expected.add((level, right if left in known else left))
+                nxt.add(j // 2)
+            elif left in known or right in known:
+                nxt.add(j // 2)
+        known = nxt
+    assert plan == expected
+    assert 0 in known  # the fold reaches the root
+
+
+def test_compact_root_detects_missing_node():
+    digests = [leaf_hash(f"/k{i}", i) for i in range(4)]
+    levels = tree_levels(digests)
+    nodes = compact_proof_nodes(levels, [0])
+    with pytest.raises(ValueError, match="missing proof node"):
+        compact_root(4, {0: digests[0]}, nodes[1:])
+
+
+def test_compact_required_rejects_out_of_range_index():
+    with pytest.raises(ValueError, match="out of range"):
+        required_proof_nodes(3, [3])
+    with pytest.raises(ValueError, match="out of range"):
+        required_proof_nodes(3, [-1])
